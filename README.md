@@ -97,7 +97,16 @@ python3 -m venv .venv
 
 ## 更新日志
 
-### v1.6.0（当前）
+### v1.6.1（当前）
+
+- 🐛 **缺失依赖声明修复**：`nodes/datatransformer.py` 与节点基类的模板渲染 / 条件求值依赖 Jinja2，
+  正式将 `jinja2>=3.0` 写入 `dependencies`（此前仅靠传递依赖，源码 / 从零环境直接安装会缺包）
+- 🧩 **配合 core v2.0.1 命名空间合并**：core 顶层 `baize` 引入 `pkgutil.extend_path` 后，
+  本模块（`baize.orchestration`）与 core 分属不同源码树 / `pip install -e` 位置时也可被直接
+  `import baize.orchestration` 发现，无需手工符号链接
+- 🚀 **升级**：版本号 1.6.1
+
+### v1.6.0
 
 - 🔄 **流水线两级模型（模板 → 实例）**：新增实例存储（`instance_store.py`），实例创建时快照模板定义，
   支持 启用/停用（绑定接收器、设置并行上限，默认 10）/ 删除 / 模板同步 / 运行历史；
