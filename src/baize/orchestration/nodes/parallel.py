@@ -57,18 +57,27 @@ class ParallelNodeExecutor(BaseNodeExecutor):
                 else:
                     results.append(item)
 
-            # 合并子节点的 nodes 记录
+            # 合并子节点的 nodes / dialog 记录（dialog 走 operator.add 累加）
             nodes = dict(state.get("nodes", {}))
+            dialog_entries: list[dict[str, Any]] = []
             for item in executed:
-                if not isinstance(item, Exception) and item.get("node_id"):
-                    result_updates = item.get("result", {})
-                    if isinstance(result_updates, dict):
-                        sub_nodes = result_updates.get("nodes", {})
-                        nodes.update(sub_nodes)
+                if isinstance(item, Exception) or not item.get("node_id"):
+                    continue
+                result_updates = item.get("result", {})
+                if not isinstance(result_updates, dict):
+                    continue
+                sub_nodes = result_updates.get("nodes", {})
+                if isinstance(sub_nodes, dict):
+                    nodes.update(sub_nodes)
+                sub_dialog = result_updates.get("dialog")
+                if isinstance(sub_dialog, list):
+                    dialog_entries.extend(sub_dialog)
 
             data = {"branches": results, "total": len(branches), "completed": len(results)}
             updates.update(self._record_done(node, state, f"{len(results)} 个分支执行完毕", data))
             updates["nodes"] = nodes
+            if dialog_entries:
+                updates["dialog"] = dialog_entries
             updates["route"] = ""
 
         except Exception as e:
@@ -89,6 +98,7 @@ def get_executor(node_type: str) -> BaseNodeExecutor:
     from baize.orchestration.nodes.subpipeline import SubpipelineNodeExecutor
     from baize.orchestration.nodes.receiver import ReceiverNodeExecutor
     from baize.orchestration.nodes.datatransformer import DataTransformerNodeExecutor
+    from baize.orchestration.nodes.end import EndNodeExecutor
 
     _registry = {
         "agent": AgentNodeExecutor,
@@ -100,6 +110,7 @@ def get_executor(node_type: str) -> BaseNodeExecutor:
         "subpipeline": SubpipelineNodeExecutor,
         "receiver": ReceiverNodeExecutor,
         "datatransformer": DataTransformerNodeExecutor,
+        "end": EndNodeExecutor,
     }
     cls = _registry.get(node_type)
     if cls is None:

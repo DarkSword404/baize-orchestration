@@ -1,7 +1,8 @@
 """
 预置流水线模板。
 
-2 个 automation (type=auto) + 2 个 manual (type=manual)。
+type=auto（可激活长驻静默运行）: soc_triage(SOC告警研判) / pentest / vuln_scan / smoke_test
+type=manual（对话触发）: phishing_analysis / human_input_test
 用户可通过 API 删除内置模板，已删除的模板不在列表中返回。
 """
 

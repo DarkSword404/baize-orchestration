@@ -37,5 +37,12 @@ SMOKE_TEST_TEMPLATE = {
                 "   {\"summary\": \"一句话总结\", \"findings\": [\"发现1\", \"发现2\"], \"severity\": \"low|medium|high\"}\n"
             ),
         },
+        {
+            "id": "end",
+            "type": "end",
+            "display_name": "结束对话",
+            "description": "冒烟测试收尾，回收本次测试对应的对话（保留运行摘要）",
+            "save_dialog": False,
+        },
     ],
 }

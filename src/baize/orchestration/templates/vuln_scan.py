@@ -43,9 +43,17 @@ VULN_SCAN_TEMPLATE = {
                 "5. 生成摘要报告"
             ),
         },
+        {
+            "id": "end",
+            "type": "end",
+            "display_name": "结束对话",
+            "description": "分析完成，回收该条报告对应的对话（保留运行摘要）",
+            "save_dialog": False,
+        },
     ],
     "edges": [
         {"source": "receiver", "target": "datatransformer"},
         {"source": "datatransformer", "target": "agent", "label": "parsed"},
+        {"source": "agent", "target": "end", "label": "done"},
     ],
 }

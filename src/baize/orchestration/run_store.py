@@ -34,11 +34,19 @@ CREATE TABLE IF NOT EXISTS runs (
     error       TEXT NOT NULL DEFAULT '',
     nodes       TEXT NOT NULL DEFAULT '{}',
     events      TEXT NOT NULL DEFAULT '[]',
-    report      TEXT NOT NULL DEFAULT ''
+    report      TEXT NOT NULL DEFAULT '',
+    dialog      TEXT NOT NULL DEFAULT '[]',
+    dialog_action TEXT NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_dedup_key
     ON runs(dedup_key) WHERE dedup_key IS NOT NULL AND dedup_key != '';
 """
+
+# 旧库渐进式迁移：给既有 runs 表补充对话相关列（幂等）
+_MIGRATIONS = [
+    "ALTER TABLE runs ADD COLUMN dialog TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE runs ADD COLUMN dialog_action TEXT NOT NULL DEFAULT ''",
+]
 
 
 class RunRecord:
@@ -72,6 +80,11 @@ class RunRecord:
         # 最终输出
         self.report: str = ""
 
+        # 流水线对话（每次入站数据 = 一条对话）：entries 追加自各节点，
+        # end 节点可标记 discard/save 决定终态回收
+        self.dialog: list[dict[str, Any]] = []
+        self.dialog_action: str = ""   # "" | "discard" | "save"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -89,6 +102,10 @@ class RunRecord:
             "events": self.events,
             "events_count": len(self.events),
             "report": self.report,
+            "dialog": self.dialog,
+            "dialog_retained": self.dialog_action != "discard" and bool(self.dialog),
+            "dialog_action": self.dialog_action,
+            "dialog_count": len(self.dialog),
         }
 
     def brief(self) -> dict[str, Any]:
@@ -116,6 +133,13 @@ class RunStore:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
+            # 渐进式迁移（老库补列，幂等）
+            for ddl in _MIGRATIONS:
+                try:
+                    self._conn.execute(ddl)
+                    self._conn.commit()
+                except sqlite3.OperationalError:
+                    pass  # 列已存在
 
     # ------------------------------------------------------------ 内部工具
     @staticmethod
@@ -131,6 +155,8 @@ class RunStore:
         rec.nodes = json.loads(row["nodes"] or "{}")
         rec.events = json.loads(row["events"] or "[]")
         rec.report = row["report"] or ""
+        rec.dialog = json.loads(row["dialog"] or "[]")
+        rec.dialog_action = row["dialog_action"] or ""
         return rec
 
     def _fetch(self, run_id: str) -> RunRecord | None:
@@ -142,8 +168,9 @@ class RunStore:
         self._conn.execute(
             """INSERT OR REPLACE INTO runs
                (run_id, pipeline_id, pipe_type, status, context, webhook, dedup_key,
-                created_at, started_at, ended_at, error, nodes, events, report)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                created_at, started_at, ended_at, error, nodes, events, report,
+                dialog, dialog_action)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 rec.run_id,
                 rec.pipeline_id,
@@ -159,6 +186,8 @@ class RunStore:
                 json.dumps(rec.nodes, ensure_ascii=False),
                 json.dumps(rec.events, ensure_ascii=False),
                 rec.report,
+                json.dumps(rec.dialog, ensure_ascii=False),
+                rec.dialog_action,
             ),
         )
         self._conn.commit()
@@ -221,8 +250,43 @@ class RunStore:
             rec.nodes = state.get("nodes", rec.nodes)
             rec.report = self._extract_report(state)
             rec.error = state.get("error", "")
+            dialog = state.get("dialog")
+            if isinstance(dialog, list):
+                rec.dialog = dialog
+            rec.dialog_action = state.get("dialog_action") or rec.dialog_action or ""
             if rec.ended_at is None:
                 rec.ended_at = time.time()
+            self._persist(rec)
+
+    # --------------------------------------------------- 对话（run 级）操作
+    def append_dialog(self, run_id: str, entries: list[dict[str, Any]]) -> None:
+        """追加对话条目（通常配合节点落库前调用；亦可用于流式追加）。"""
+        if not entries:
+            return
+        with self._lock:
+            rec = self._fetch(run_id)
+            if not rec:
+                return
+            rec.dialog.extend(entries)
+            self._persist(rec)
+
+    def set_dialog_action(self, run_id: str, action: str) -> None:
+        """标记对话处置动作：discard（回收删除）/ save（保留归档）。"""
+        with self._lock:
+            rec = self._fetch(run_id)
+            if not rec:
+                return
+            rec.dialog_action = action
+            self._persist(rec)
+
+    def discard_dialog(self, run_id: str) -> None:
+        """回收对话：清空对话内容，仅保留 run 摘要/节点记录（历史仍可查）。"""
+        with self._lock:
+            rec = self._fetch(run_id)
+            if not rec:
+                return
+            rec.dialog = []
+            rec.dialog_action = "discard"
             self._persist(rec)
 
     @staticmethod
@@ -326,37 +390,102 @@ class RunStore:
 # 流水线激活状态管理
 # ====================================================================
 
-class PipelineActivationStore:
-    """自动化流水线激活状态管理。
+_ACTIVATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS activations (
+    pipeline_id TEXT PRIMARY KEY,
+    active      INTEGER NOT NULL DEFAULT 0,
+    receiver_id TEXT NOT NULL DEFAULT '',
+    updated_at  REAL NOT NULL
+);
+"""
 
-    auto 类型的流水线创建后默认关闭，需要用户手动开启后才开始接收数据。
+
+class PipelineActivationStore:
+    """自动化流水线激活状态管理（SQLite 持久化）。
+
+    auto 类型的流水线创建后默认关闭，需要用户手动开启后才开始接收数据；
+    激活态跨重启保留，服务重启后由 SessionSupervisor.resume_all() 恢复长驻会话。
     manual 类型的流水线始终处于可用状态，供对话时选择。
+
+    receiver_id 记录该流水线绑定的数据接收器（激活时由请求方提供），
+    供 Supervisor 会话 claim 收件箱数据。
     """
 
-    def __init__(self):
+    def __init__(self, db_path: str | Path | None = None):
+        self._db_path = str(db_path or os.environ.get("BAIZE_RUNS_DB") or _DEFAULT_DB_PATH)
+        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._activations: dict[str, bool] = {}  # pipeline_id -> is_active
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.executescript(_ACTIVATION_SCHEMA)
+            self._conn.commit()
+        self._activations: dict[str, bool] = {}   # pipeline_id -> is_active
+        self._bindings: dict[str, str] = {}       # pipeline_id -> receiver_id
+        self._load()
+
+    def _load(self) -> None:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT pipeline_id, active, receiver_id FROM activations"
+            ).fetchall()
+        for r in rows:
+            self._activations[str(r["pipeline_id"])] = bool(r["active"])
+            rid = str(r["receiver_id"] or "")
+            if rid:
+                self._bindings[str(r["pipeline_id"])] = rid
+
+    def _persist(self, pipeline_id: str) -> None:
+        # 注意：仅由已持有 self._lock 的公开方法调用（activate/deactivate/
+        # set_binding），自身不得再加锁——threading.Lock 不可重入，否则死锁。
+        self._conn.execute(
+            "INSERT OR REPLACE INTO activations (pipeline_id, active, receiver_id, updated_at)"
+            " VALUES (?, ?, ?, ?)",
+            (
+                pipeline_id,
+                1 if self._activations.get(pipeline_id, False) else 0,
+                self._bindings.get(pipeline_id, ""),
+                time.time(),
+            ),
+        )
+        self._conn.commit()
 
     def is_active(self, pipeline_id: str) -> bool:
         with self._lock:
             return self._activations.get(pipeline_id, False)
 
-    def activate(self, pipeline_id: str) -> None:
+    def activate(self, pipeline_id: str, receiver_id: str = "") -> None:
         with self._lock:
             self._activations[pipeline_id] = True
+            if receiver_id:
+                self._bindings[pipeline_id] = receiver_id
+            self._persist(pipeline_id)
 
     def deactivate(self, pipeline_id: str) -> None:
         with self._lock:
             self._activations[pipeline_id] = False
+            self._persist(pipeline_id)
 
     def get_all_active(self) -> list[str]:
         with self._lock:
             return [pid for pid, active in self._activations.items() if active]
 
+    def get_binding(self, pipeline_id: str) -> str:
+        """返回流水线绑定的接收器 id（可能为空串）。"""
+        with self._lock:
+            return self._bindings.get(pipeline_id, "")
+
+    def set_binding(self, pipeline_id: str, receiver_id: str) -> None:
+        with self._lock:
+            self._bindings[pipeline_id] = receiver_id
+            self._persist(pipeline_id)
+
     def get_status(self, pipeline_id: str) -> dict[str, Any]:
         return {
             "pipeline_id": pipeline_id,
             "active": self.is_active(pipeline_id),
+            "receiver_id": self.get_binding(pipeline_id),
         }
 
 

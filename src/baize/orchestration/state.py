@@ -59,6 +59,12 @@ class PipelineState(TypedDict, total=False):
     # ---- 消息历史 ----
     messages: Annotated[list[dict[str, str]], operator.add]
 
+    # ---- 流水线对话（每次入站数据 = 一条对话）----
+    # 各节点用 operator.add 追加条目（input/llm/note...），
+    # end 节点通过 dialog_action 标记 "discard"（终态回收）或 "save"（保留归档）。
+    dialog: Annotated[list[dict[str, Any]], operator.add]
+    dialog_action: str
+
     # ---- 输出 ----
     status: PipelineRunStatus     # pending | running | completed | failed | paused
     error: str
@@ -66,6 +72,7 @@ class PipelineState(TypedDict, total=False):
 
     # ---- 图路由 ----
     route: str                    # 条件分支选择的目的节点 ID
+    _err_route: str               # 失败分支标记：等于某节点 ID 时该节点被路由到 error_target
 
 
 def build_initial_state(
@@ -92,8 +99,11 @@ def build_initial_state(
         confirm_options=[],
         human_response="",
         messages=[],
+        dialog=[],
+        dialog_action="",
         status="pending",
         error="",
         report="",
         route="",
+        _err_route="",
     )

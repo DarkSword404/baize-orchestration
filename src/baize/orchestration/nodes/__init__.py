@@ -10,6 +10,7 @@ from baize.orchestration.nodes.transform import TransformNodeExecutor
 from baize.orchestration.nodes.subpipeline import SubpipelineNodeExecutor
 from baize.orchestration.nodes.receiver import ReceiverNodeExecutor
 from baize.orchestration.nodes.datatransformer import DataTransformerNodeExecutor
+from baize.orchestration.nodes.end import EndNodeExecutor
 
 __all__ = [
     "BaseNodeExecutor",
@@ -22,5 +23,6 @@ __all__ = [
     "SubpipelineNodeExecutor",
     "ReceiverNodeExecutor",
     "DataTransformerNodeExecutor",
+    "EndNodeExecutor",
     "get_executor",
 ]

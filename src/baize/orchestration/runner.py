@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Any, AsyncGenerator, Callable
@@ -24,8 +25,10 @@ from baize.orchestration.run_store import RunRecord, get_run_store
 
 logger = logging.getLogger(__name__)
 
-# 最大并发执行数
-DEFAULT_MAX_CONCURRENT = 5
+# 进程级最大并发执行数（全局兜底背压，防止多个实例/手动 run 叠加压垮模型提供商）。
+# 每个实例自己的并行度由实例的 max_concurrency 控制（默认 10，见 instance_store.DEFAULT_MAX_CONCURRENCY），
+# 故全局兜底默认需高于单实例上限，避免成为瓶颈；可用环境变量 BAIZE_PIPELINE_MAX_CONCURRENT 覆盖。
+DEFAULT_MAX_CONCURRENT = max(1, int(os.environ.get("BAIZE_PIPELINE_MAX_CONCURRENT", "20")))
 
 
 class PipelineRunner:
@@ -47,6 +50,15 @@ class PipelineRunner:
     # ------------------------------------------------------------------
     # Public — 启动执行
     # ------------------------------------------------------------------
+
+    def _recycle_dialog_if_discarded(self, run_id: str) -> None:
+        """对话生命周期终态钩子：run 正常完成且 end 节点标记 discard 时回收对话。"""
+        try:
+            done = self._store.get(run_id)
+            if done and done.status == "completed" and done.dialog_action == "discard":
+                self._store.discard_dialog(run_id)
+        except Exception:  # noqa: BLE001 — 回收失败不应阻塞 run 终态事件
+            logger.exception(f"run {run_id} 对话回收失败（忽略）")
 
     async def submit(
         self,
@@ -82,6 +94,36 @@ class PipelineRunner:
         asyncio.create_task(self._execute(pipeline, run_id, context, webhook))
 
         return run_id
+
+    async def execute_one(
+        self,
+        pipeline: PipelineDefinition,
+        context: dict[str, Any],
+        webhook: str = "",
+        dedup_key: str = "",
+    ) -> RunRecord | None:
+        """同步执行一次并等待终态（长驻会话逐条处理告警用）。
+
+        内部复用 submit() 的执行路径与 dedup 幂等语义：
+        - dedup_key 命中既有记录时直接返回既有 run（不重复执行）；
+        - 否则提交后台任务并轮询 store 直到 completed / failed / paused。
+        """
+        run_id = await self.submit(pipeline, context, webhook, dedup_key)
+        record = self._store.get(run_id)
+        if record is None:
+            return None
+        if record.status in ("completed", "failed", "paused"):
+            return record
+
+        timeout = float(getattr(pipeline, "timeout_seconds", None) or 3600) + 60.0
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            await asyncio.sleep(0.5)
+            record = self._store.get(run_id)
+            if record and record.status in ("completed", "failed", "paused"):
+                return record
+        logger.warning(f"execute_one 等待 {pipeline.id}/{run_id} 超时（{timeout}s）")
+        return self._store.get(run_id)
 
     # ------------------------------------------------------------------
     # Public — 查询状态
@@ -265,6 +307,7 @@ class PipelineRunner:
                     return
 
                 self._store.set_final_state(run_id, final)
+                self._recycle_dialog_if_discarded(run_id)
                 self._push_event(run_id, {
                     "event_id": str(uuid.uuid4()),
                     "type": "pipeline_completed",
@@ -327,6 +370,7 @@ class PipelineRunner:
                 if result.get("status", "pending") == "pending":
                     result["status"] = "completed"
                 self._store.set_final_state(run_id, result)
+                self._recycle_dialog_if_discarded(run_id)
                 done_record = self._store.get(run_id)
                 done_report = done_record.report if done_record else result.get("report", "")
                 self._push_event(run_id, {

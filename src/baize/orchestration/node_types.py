@@ -20,7 +20,7 @@ from typing import Any, Literal
 
 NodeTypeKind = Literal[
     "agent", "decision", "ai_decision", "parallel", "confirm", "transform",
-    "subpipeline", "receiver", "datatransformer",
+    "subpipeline", "receiver", "datatransformer", "end",
 ]
 
 
@@ -38,6 +38,21 @@ class ParallelBranch:
     """并行节点的单个分支。"""
     node_id: str                 # 分支对应的子节点 ID（可直接是子 pipeline 定义）
     node: "PipelineNode | None" = None  # 内联子节点定义
+
+
+@dataclass
+class PipelineEdge:
+    """图编排连线：source → target 的有向边。
+
+    - 条件节点（decision/ai_decision/confirm）的路由仍由 branches /
+      confirm_branches 描述，画布连线仅作为辅助展示；
+    - 普通节点（agent/transform/receiver/end/subpipeline/parallel）的
+      默认流转以 edges 为准（若提供），未提供时回退到节点列表顺序推断，
+      保证旧模板兼容。
+    """
+    source: str
+    target: str
+    label: str = ""              # 边标签（可读说明 / 条件分支名）
 
 
 # ---- 节点类型定义 ----
@@ -72,12 +87,19 @@ class PipelineNode:
     # ---- node (重定向目标，避免与 built-in 冲突) ----
     target: str = ""             # 显式指定的下一个节点（覆盖路由推断）
 
+    # ---- end (结束对话节点) 专用 ----
+    save_dialog: bool = False    # True=本次对话保留归档；False=默认回收删除
+
     # ---- subpipeline 专用 ----
     sub_nodes: list["PipelineNode"] = field(default_factory=list)
 
     # ---- 超时 / 重试 ----
     timeout_seconds: int = 300
     max_retries: int = 1
+
+    # ---- 失败语义（SOAR 失败分支） ----
+    error_target: str = ""       # 节点执行失败时的路由目标 node_id（可选）
+    ignore_error: bool = False   # True=失败仅记录，继续走正常路径（不触发失败分支）
 
     @property
     def is_human_node(self) -> bool:
@@ -95,6 +117,7 @@ class PipelineDefinition:
     tags: list[str] = field(default_factory=list)
 
     nodes: list[PipelineNode] = field(default_factory=list)
+    edges: list[PipelineEdge] = field(default_factory=list)
     triggers: list[str] = field(default_factory=list)
     context_schema: dict[str, Any] = field(default_factory=dict)
 

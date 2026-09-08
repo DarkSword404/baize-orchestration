@@ -1,6 +1,6 @@
 [project]
 name = "baize-orchestration"
-version = "1.3.0"
+version = "1.5.0"
 description = "Baize (白泽) orchestration module — LangGraph-powered pipeline automation for cybersecurity operations"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 dependencies = [
-  "baize-core>=1.3.1",
+  "baize-core>=1.8.0,<3.0.0",
   "langgraph>=0.2.0",
   "langgraph-checkpoint>=2.0.0",
   "pyyaml>=6.0",

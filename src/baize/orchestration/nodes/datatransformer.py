@@ -67,17 +67,18 @@ class DataTransformerNodeExecutor(BaseNodeExecutor):
         updates: dict[str, Any] = self._record_start(node, state)
 
         try:
-            # 获取上游 receiver 的输出
-            steps = state.get("steps", {})
+            # 节点执行记录存放在 state["nodes"]（base._record_done 写入 node_type 字段）；
+            # 模板渲染里习惯称 steps，这里兼容两种取值来源。
+            steps = state.get("steps") or state.get("nodes") or {}
             # 找最近的 receiver 节点输出
             upstream_output = ""
-            for key, val in reversed(steps.items()):
-                if isinstance(val, dict) and val.get("type") == "receiver":
+            for key, val in reversed(list(steps.items())):
+                if isinstance(val, dict) and val.get("node_type") == "receiver":
                     upstream_output = val.get("output", "")
                     break
             if not upstream_output:
                 # 降级：使用最近任意节点的输出
-                for key, val in reversed(steps.items()):
+                for key, val in reversed(list(steps.items())):
                     if isinstance(val, dict):
                         upstream_output = val.get("output", "")
                         break

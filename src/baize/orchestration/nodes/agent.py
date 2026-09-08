@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 from baize.orchestration.state import PipelineState
@@ -63,6 +64,16 @@ class AgentNodeExecutor(BaseNodeExecutor):
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": output},
             ]
+            # 4b. 追加到流水线对话（与核心会话库隔离，随 run 保存/回收）
+            updates["dialog"] = [{
+                "kind": "llm",
+                "node": node.id,
+                "node_type": node.type,
+                "agent": node.agent or "",
+                "prompt": prompt,
+                "output": output,
+                "timestamp": time.time(),
+            }]
 
             # 5. 设置路由 — agent 完成后默认去下一个节点
             updates["route"] = ""

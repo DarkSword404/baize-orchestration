@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any, Callable
@@ -27,6 +28,14 @@ logger = logging.getLogger(__name__)
 
 # === LangGraph 节点函数名前缀，避免冲突 ===
 NODE_PREFIX = "_pnode_"
+
+# 普通（非条件）节点类型：走默认路径；失败时若配置 error_target 可走失败分支
+_PLAIN_NODE_TYPES = frozenset({
+    "agent", "transform", "subpipeline", "parallel", "receiver", "datatransformer", "end",
+})
+
+# 失败分支条件边的默认出口 key
+_ERR_OK_KEY = "__default__"
 
 # 模块级默认 checkpointer 单例。
 # 关键：runner 每次执行会新建 PipelineGraphCompiler，若各自持有独立 MemorySaver，
@@ -255,7 +264,26 @@ class PipelineGraphCompiler:
             executor = get_executor(node.type)
             self._executors[node.id] = executor
 
+            # parallel 节点：把画布中引用的顶层普通节点解析为可执行的内联子定义
+            if node.type == "parallel":
+                self._resolve_parallel_node_refs(node)
+
             graph.add_node(langgraph_name, self._make_node_func(node))
+
+    def _resolve_parallel_node_refs(self, node: PipelineNode) -> None:
+        """parallel 节点引用的顶层节点（node_id 匹配）转为内联子节点定义。
+
+        仅支持普通可执行节点（agent/transform/receiver/datatransformer）；
+        不支持嵌套 parallel/decision/confirm —— 复杂并行请使用 subpipeline。
+        """
+        from dataclasses import replace
+        for pb in node.parallel_branches:
+            if pb.node is not None or not pb.node_id:
+                continue
+            ref = self.pipeline.get_node(pb.node_id)
+            if ref is None or ref.type not in ("agent", "transform", "receiver", "datatransformer"):
+                continue
+            pb.node = replace(ref)
 
     # ------------------------------------------------------------------
     # 边连接
@@ -300,27 +328,77 @@ class PipelineGraphCompiler:
                     self._build_confirm_path_map(node),
                 )
 
-            elif node.type in ("agent", "transform", "subpipeline", "parallel", "receiver", "datatransformer"):
-                # 普通节点：顺序连接到下一个节点
-                next_node = self._find_next_node(node.id)
-                if next_node:
+            elif node.type in _PLAIN_NODE_TYPES:
+                # 普通节点：优先沿显式连线（edges）流转；无连线时顺序推断（兼容旧模板）
+                next_node = self._default_next_of(node)
+                if node.error_target and not node.ignore_error and node.type != "end":
+                    # 失败分支：执行失败时路由到 error_target，否则走默认出口
+                    next_name = self._node_names[next_node.id] if next_node else END
+                    path_map = {
+                        node.error_target: self._node_names.get(node.error_target, END),
+                        _ERR_OK_KEY: next_name,
+                    }
+                    graph.add_conditional_edges(
+                        lang_name,
+                        self._make_error_router(node),
+                        path_map,
+                    )
+                elif next_node:
                     graph.add_edge(lang_name, self._node_names[next_node.id])
                 else:
                     graph.add_edge(lang_name, END)
 
+    def _default_next_of(self, node: PipelineNode) -> PipelineNode | None:
+        """计算普通节点的默认下一节点（不带失败分支语义时）。
+
+        解析顺序（画布连线 > 显式 target > 列表顺序推断）：
+        1. pipeline.edges 中以当前节点为起点、且属于其"默认路径"的出边目标：
+           - 普通节点：仅允许 1 条默认出边（多条会被 validators 提示，这里取第一条并告警）
+           - parallel 节点：取目标不在其 parallel_branches 中的出边（并行分支由 executor 内部执行，
+             post-merge 只继续到收尾节点）
+        2. 回退 node.target 显式指定
+        3. 回退 _find_next_node 顺序推断（legacy 模板）
+        """
+        if node.target:
+            target = self.pipeline.get_node(node.target)
+            if target:
+                return target
+
+        out_targets: list[str] = []
+        for e in self.pipeline.edges:
+            if e.source == node.id and e.target != node.id:
+                if e.target not in out_targets:
+                    out_targets.append(e.target)
+        if out_targets:
+            if node.type == "parallel":
+                branch_ids = {pb.node_id for pb in node.parallel_branches}
+                merge_targets = [t for t in out_targets if t not in branch_ids]
+                if len(merge_targets) == 1:
+                    return self.pipeline.get_node(merge_targets[0])
+                # 多条/零条收尾边时回退顺序推断
+                out_targets = []
+            else:
+                if len(out_targets) == 1:
+                    return self.pipeline.get_node(out_targets[0])
+                if len(out_targets) > 1:
+                    logger.warning(
+                        "节点 %s 存在 %d 条出边，普通节点仅支持 1 条默认出边，"
+                        "取第一条 %s（多路并行请使用 parallel 节点）",
+                        node.id, len(out_targets), out_targets[0],
+                    )
+                    return self.pipeline.get_node(out_targets[0])
+
+        return self._find_next_node(node.id)
+
     def _find_next_node(self, current_id: str) -> PipelineNode | None:
-        """找到当前节点的下一个（线性）节点。
+        """顺序推断当前节点的下一个（线性）节点。
 
         规则：
-        - 优先使用 node.target 显式指定的下一个节点
-        - 否则按定义顺序取下一个节点（decision / ai_decision 也可作顺序边目标）
+        - 按定义顺序取下一个节点
         - 跳过已被条件边（decision / ai_decision / confirm）作为分支目标的节点，
-          避免线性推断导致分支节点被重复执行
+          以及被 parallel 节点作为并行子分支引用的节点 —— 它们由分支路由/并行
+          executor 触发，避免线性推断导致被重复执行。
         """
-        node = self.pipeline.get_node(current_id)
-        if node and node.target:
-            return self.pipeline.get_node(node.target)
-
         found_current = False
         for n in self.pipeline.nodes:
             if n.id == current_id:
@@ -333,13 +411,16 @@ class PipelineGraphCompiler:
         return None
 
     def _is_conditional_target(self, node_id: str) -> bool:
-        """该节点是否已被某个条件节点的分支作为目标。"""
+        """该节点是否已被某个条件节点分支 / parallel 子分支作为目标。"""
         for n in self.pipeline.nodes:
             if n.type in ("decision", "ai_decision"):
                 if node_id in {b.target for b in n.branches}:
                     return True
             elif n.type == "confirm":
                 if node_id in set(n.confirm_branches.values()):
+                    return True
+            elif n.type == "parallel":
+                if node_id in {pb.node_id for pb in n.parallel_branches}:
                     return True
         return False
 
@@ -348,16 +429,57 @@ class PipelineGraphCompiler:
     # ------------------------------------------------------------------
 
     def _make_node_func(self, node: PipelineNode) -> Callable:
-        """为节点生成 LangGraph 节点执行函数。"""
+        """为节点生成 LangGraph 节点执行函数。
+
+        普通节点（agent/transform/...）额外套一层失败策略：
+        - max_retries > 1 时按退避重试；
+        - 全部失败且配置了 error_target 时标记失败分支（_err_route），
+          由条件边路由到错误处理节点（若 ignore_error=True 则仅记录并继续）。
+        """
 
         async def _execute_node(state: PipelineState) -> dict[str, Any]:
             executor = self._executors[node.id]
-            result = await executor.execute(node, state)
+            if node.type in _PLAIN_NODE_TYPES:
+                result = await self._run_with_policy(node, executor, state)
+            else:
+                result = await executor.execute(node, state)
             if isinstance(result, dict):
                 result["current_node_type"] = node.type
+                if node.type in _PLAIN_NODE_TYPES and "_err_route" not in result:
+                    result["_err_route"] = ""
             return result
 
         return _execute_node
+
+    async def _run_with_policy(
+        self,
+        node: PipelineNode,
+        executor: BaseNodeExecutor,
+        state: PipelineState,
+    ) -> dict[str, Any]:
+        """执行节点并应用重试 / 失败分支策略。"""
+        attempts = max(1, int(node.max_retries or 1))
+        updates: dict[str, Any] = {}
+        for attempt in range(attempts):
+            if attempt > 0:
+                await asyncio.sleep(min(2.0, 0.5 * attempt))
+            updates = await executor.execute(node, state)
+            rec = (updates.get("nodes") or {}).get(node.id) or {}
+            if rec.get("status") != "failed":
+                return updates
+        # 全部尝试失败：失败分支 / 忽略 / 默认（与旧行为一致：继续主路径）
+        updates["_err_route"] = node.id if (node.error_target and not node.ignore_error) else ""
+        return updates
+
+    def _make_error_router(self, node: PipelineNode) -> Callable:
+        """生成失败分支节点的路由函数：失败走 error_target，正常走默认出口。"""
+
+        def _route(state: PipelineState) -> str:
+            if state.get("_err_route") == node.id:
+                return node.error_target
+            return _ERR_OK_KEY
+
+        return _route
 
     def _make_decision_router(self, node: PipelineNode) -> Callable:
         """生成 decision 节点的条件路由函数。"""
